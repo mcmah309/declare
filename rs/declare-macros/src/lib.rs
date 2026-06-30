@@ -4,8 +4,8 @@ use proc_macro::TokenStream;
 use proc_macro2::{TokenStream as TokenStream2, TokenTree};
 use quote::{ToTokens, quote};
 use syn::{
-    Fields, FieldsNamed, GenericParam, Generics, Ident, ItemEnum, PathArguments, Token, Type,
-    WhereClause,
+    Attribute, Fields, FieldsNamed, GenericParam, Generics, Ident, ItemEnum, PathArguments, Token,
+    Type, WhereClause,
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
@@ -37,52 +37,43 @@ impl Parse for DeclareConfig {
     }
 }
 
-fn collect_declare_macros(initial: &mut DeclareConfig, attrs: &mut Vec<syn::Attribute>) {
-    let mut new_attrs = Vec::with_capacity(attrs.len());
-    for attr in attrs.drain(..) {
-        let mut segments = attr.path().segments.iter().rev();
-        let name = segments.next();
-        let Some(name) = name else {
-            new_attrs.push(attr);
-            continue;
-        };
-        if !matches!(name.arguments, PathArguments::None) {
-            new_attrs.push(attr);
-            continue;
+fn collect_declare_macros(initial: &mut DeclareConfig, attrs: &mut Vec<Attribute>) {
+    attrs.retain(|attr| {
+        let path = attr.path();
+        // Ensure there are no generic arguments in the entire path
+        if path
+            .segments
+            .iter()
+            .any(|s| !matches!(s.arguments, PathArguments::None))
+        {
+            return true;
         }
-        let crate_name = segments.next();
-        if let Some(crate_name) = crate_name {
-            if !matches!(crate_name.arguments, PathArguments::None) {
-                new_attrs.push(attr);
-                continue;
-            }
-            if crate_name.ident != "declare" {
-                new_attrs.push(attr);
-                continue;
-            }
-        }
-        if segments.next().is_some() {
-            new_attrs.push(attr);
-            continue;
-        }
-        match &*name.ident.to_string() {
-            "augment" => {
+        let segments: Vec<_> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+
+        match segments
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["augment"] | ["declare", "augment"] => {
                 let config: DeclareConfig = attr.parse_args().unwrap_or_default();
                 initial.newtype_variants |= config.newtype_variants;
                 initial.common_accessors |= config.common_accessors;
+                false
             }
-            "newtype_variants" => {
+            ["newtype_variants"] | ["declare", "newtype_variants"] => {
                 initial.newtype_variants = true;
+                false
             }
-            "common_accessors" => {
+            ["common_accessors"] | ["declare", "common_accessors"] => {
                 initial.common_accessors = true;
+                false
             }
-            _ => {
-                new_attrs.push(attr);
-            }
+            // Any other attribute (e.g., #[derive(...)], #[inline])
+            _ => true,
         }
-    }
-    attrs.extend(new_attrs);
+    });
 }
 
 //************************************************************************//
