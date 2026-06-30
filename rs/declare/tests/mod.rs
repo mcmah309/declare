@@ -1,4 +1,6 @@
-#[declare::extra(newtype_variants, common_accessors)]
+#[declare::newtype_variants]
+#[declare::common_accessors]
+// #[declare::augment(newtype_variants, common_accessors)]
 #[derive(Debug)]
 enum A<'a, T>
 where

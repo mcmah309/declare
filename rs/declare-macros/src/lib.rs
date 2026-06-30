@@ -4,38 +4,85 @@ use proc_macro::TokenStream;
 use proc_macro2::{TokenStream as TokenStream2, TokenTree};
 use quote::{ToTokens, quote};
 use syn::{
-    Fields, FieldsNamed, GenericParam, Generics, Ident, ItemEnum, Token, Type, WhereClause,
+    Fields, FieldsNamed, GenericParam, Generics, Ident, ItemEnum, PathArguments, Token, Type,
+    WhereClause,
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
 };
 
-struct ExtraArgs {
+#[derive(Default, Clone)]
+struct DeclareConfig {
     newtype_variants: bool,
     common_accessors: bool,
 }
 
-impl Parse for ExtraArgs {
+impl Parse for DeclareConfig {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let idents = Punctuated::<Ident, Token![,]>::parse_terminated(input)?;
-        let mut args = ExtraArgs {
-            newtype_variants: false,
-            common_accessors: false,
-        };
+        let mut config = DeclareConfig::default();
         for id in idents {
             match id.to_string().as_str() {
-                "newtype_variants" => args.newtype_variants = true,
-                "common_accessors" => args.common_accessors = true,
+                "newtype_variants" => config.newtype_variants = true,
+                "common_accessors" => config.common_accessors = true,
                 other => {
                     return Err(syn::Error::new(
                         id.span(),
-                        format!("unknown `declare::extra` option `{other}`"),
+                        format!("unknown `declare` option `{other}`"),
                     ));
                 }
             }
         }
-        Ok(args)
+        Ok(config)
     }
+}
+
+fn collect_declare_macros(initial: &mut DeclareConfig, attrs: &mut Vec<syn::Attribute>) {
+    let mut new_attrs = Vec::with_capacity(attrs.len());
+    for attr in attrs.drain(..) {
+        let mut segments = attr.path().segments.iter().rev();
+        let name = segments.next();
+        let Some(name) = name else {
+            new_attrs.push(attr);
+            continue;
+        };
+        if !matches!(name.arguments, PathArguments::None) {
+            new_attrs.push(attr);
+            continue;
+        }
+        let crate_name = segments.next();
+        if let Some(crate_name) = crate_name {
+            if !matches!(crate_name.arguments, PathArguments::None) {
+                new_attrs.push(attr);
+                continue;
+            }
+            if crate_name.ident != "declare" {
+                new_attrs.push(attr);
+                continue;
+            }
+        }
+        if segments.next().is_some() {
+            new_attrs.push(attr);
+            continue;
+        }
+        match &*name.ident.to_string() {
+            "augment" => {
+                let config: DeclareConfig = attr.parse_args().unwrap_or_default();
+                initial.newtype_variants |= config.newtype_variants;
+                initial.common_accessors |= config.common_accessors;
+            }
+            "newtype_variants" => {
+                initial.newtype_variants = true;
+            }
+            "common_accessors" => {
+                initial.common_accessors = true;
+            }
+            _ => {
+                new_attrs.push(attr);
+            }
+        }
+    }
+    attrs.extend(new_attrs);
 }
 
 //************************************************************************//
@@ -210,10 +257,38 @@ enum Mode {
 //************************************************************************//
 
 #[proc_macro_attribute]
-pub fn extra(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as ExtraArgs);
+pub fn newtype_variants(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(item as ItemEnum);
 
+    let mut config = DeclareConfig {
+        newtype_variants: true,
+        common_accessors: false,
+    };
+    collect_declare_macros(&mut config, &mut input.attrs);
+    expand_fully(input, &config)
+}
+
+#[proc_macro_attribute]
+pub fn common_accessors(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut input = parse_macro_input!(item as ItemEnum);
+
+    let mut config = DeclareConfig {
+        newtype_variants: false,
+        common_accessors: true,
+    };
+    collect_declare_macros(&mut config, &mut input.attrs);
+    expand_fully(input, &config)
+}
+
+#[doc(hidden)]
+#[proc_macro_attribute]
+pub fn augment(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let config = parse_macro_input!(attr as DeclareConfig);
+    let input = parse_macro_input!(item as ItemEnum);
+    expand_fully(input, &config)
+}
+
+fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
     let enum_ident = input.ident.clone();
     let enum_generics = input.generics.clone();
     let (enum_impl_g, enum_ty_g, enum_where_g) = enum_generics.split_for_impl();
@@ -229,7 +304,7 @@ pub fn extra(attr: TokenStream, item: TokenStream) -> TokenStream {
             .position(|a| a.path().is_ident("newtype"));
 
         if let Some(pos) = struct_attr_pos {
-            if !args.newtype_variants {
+            if !config.newtype_variants {
                 panic!("`#[newtype]` requires `newtype_variants` to be enabled");
             }
             variant.attrs.remove(pos);
@@ -341,7 +416,7 @@ pub fn extra(attr: TokenStream, item: TokenStream) -> TokenStream {
         output.extend(c);
     }
 
-    if args.common_accessors {
+    if config.common_accessors {
         output.extend(generate_accessors(
             &enum_ident,
             &enum_generics,
