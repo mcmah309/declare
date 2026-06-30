@@ -3,7 +3,7 @@
 [![github](https://img.shields.io/badge/github-mcmah309/declare-8da0cb?style=for-the-badge\&labelColor=555555\&logo=github)](https://github.com/mcmah309/declare)
 [![crates.io](https://img.shields.io/crates/v/declare.svg?style=for-the-badge\&color=fc8d62\&logo=rust)](https://crates.io/crates/declare)
 [![docs.rs](https://img.shields.io/badge/docs.rs-declare-66c2a5?style=for-the-badge\&labelColor=555555\&logo=docs.rs)](https://docs.rs/declare)
-[![test status](https://img.shields.io/github/actions/workflow/status/mcmah309/declare/ci.yml?branch=master\&style=for-the-badge)](https://github.com/mcmah309/declare/actions/workflows/ci.yml)
+[![test status](https://img.shields.io/github/actions/workflow/status/mcmah309/declare/ci.yml?branch=main\&style=for-the-badge)](https://github.com/mcmah309/declare/actions/workflows/ci.yml)
 
 `declare` provides macros for reducing boilerplate around common Rust declarations. Rather than introducing new syntax, it generates the code you would typically write by hand while keeping the source concise and explicit.
 
