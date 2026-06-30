@@ -11,6 +11,7 @@ edition = "2024"
 # rust-version = "" # Min required rust version
 
 [dependencies]
+declare_macros = { path = "../declare_macros" } # version = "0.0.1"
 
 [dev-dependencies]
 

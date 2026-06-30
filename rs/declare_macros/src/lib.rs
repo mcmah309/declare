@@ -1,0 +1,591 @@
+use std::collections::HashSet;
+
+use proc_macro::TokenStream;
+use proc_macro2::{TokenStream as TokenStream2, TokenTree};
+use quote::{ToTokens, quote};
+use syn::{
+    Fields, FieldsNamed, GenericParam, Generics, Ident, ItemEnum, Token, Type, WhereClause,
+    parse::{Parse, ParseStream},
+    parse_macro_input, parse_quote,
+    punctuated::Punctuated,
+};
+
+struct ExtraArgs {
+    newtype_variants: bool,
+    common_accessors: bool,
+}
+
+impl Parse for ExtraArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let idents = Punctuated::<Ident, Token![,]>::parse_terminated(input)?;
+        let mut args = ExtraArgs {
+            newtype_variants: false,
+            common_accessors: false,
+        };
+        for id in idents {
+            match id.to_string().as_str() {
+                "newtype_variants" => args.newtype_variants = true,
+                "common_accessors" => args.common_accessors = true,
+                other => {
+                    return Err(syn::Error::new(
+                        id.span(),
+                        format!("unknown `declare::extra` option `{other}`"),
+                    ));
+                }
+            }
+        }
+        Ok(args)
+    }
+}
+
+//************************************************************************//
+
+fn collect_names(ts: TokenStream2, names: &mut HashSet<String>) {
+    let mut iter = ts.into_iter().peekable();
+    while let Some(tt) = iter.next() {
+        match tt {
+            TokenTree::Group(g) => collect_names(g.stream(), names),
+            TokenTree::Ident(id) => {
+                names.insert(id.to_string());
+            }
+            TokenTree::Punct(p) if p.as_char() == '\'' => {
+                if let Some(TokenTree::Ident(id)) = iter.peek() {
+                    names.insert(format!("'{id}"));
+                    iter.next();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn names_of<T: ToTokens>(t: &T) -> HashSet<String> {
+    let mut s = HashSet::new();
+    collect_names(quote!(#t), &mut s);
+    s
+}
+
+//************************************************************************//
+
+fn param_name(p: &GenericParam) -> String {
+    match p {
+        GenericParam::Lifetime(lp) => format!("'{}", lp.lifetime.ident),
+        GenericParam::Type(tp) => tp.ident.to_string(),
+        GenericParam::Const(cp) => cp.ident.to_string(),
+    }
+}
+
+fn filter_generics(generics: &Generics, used: &HashSet<String>) -> Generics {
+    let mut new_generics = Generics::default();
+
+    for param in &generics.params {
+        if used.contains(&param_name(param)) {
+            new_generics.params.push(param.clone());
+        }
+    }
+
+    if let Some(wc) = &generics.where_clause {
+        let preds: Punctuated<_, Token![,]> = wc
+            .predicates
+            .iter()
+            .filter(|pred| {
+                let pred_names = names_of(pred);
+                pred_names.intersection(used).next().is_some()
+            })
+            .cloned()
+            .collect();
+
+        if !preds.is_empty() {
+            new_generics.where_clause = Some(WhereClause {
+                where_token: wc.where_token,
+                predicates: preds,
+            });
+        }
+    }
+
+    new_generics
+}
+
+/// Build the `<'a, T>` style argument list used at a *use site* (no bounds).
+fn use_site_generics(generics: &Generics) -> TokenStream2 {
+    if generics.params.is_empty() {
+        return quote!();
+    }
+    let args = generics.params.iter().map(|p| match p {
+        GenericParam::Lifetime(lp) => {
+            let lt = &lp.lifetime;
+            quote!(#lt)
+        }
+        GenericParam::Type(tp) => {
+            let i = &tp.ident;
+            quote!(#i)
+        }
+        GenericParam::Const(cp) => {
+            let i = &cp.ident;
+            quote!(#i)
+        }
+    });
+    quote!(<#(#args),*>)
+}
+
+//************************************************************************//
+
+#[derive(Clone)]
+struct FieldInfo {
+    ident: Ident,
+    ty: Type,
+}
+
+#[derive(Clone)]
+enum VariantKind {
+    /// Generated from `#[newtype]`: `Variant(StructName<...>)`.
+    NewType {
+        binding: Ident,
+        fields: Vec<FieldInfo>,
+    },
+    /// A plain `Variant { a: T, b: U }` left untouched.
+    InlineNamed { fields: Vec<FieldInfo> },
+    /// `Variant` with no data.
+    Unit,
+}
+
+#[derive(Clone)]
+struct VariantInfo {
+    ident: Ident,
+    kind: VariantKind,
+}
+
+impl VariantInfo {
+    fn field(&self, name: &str) -> Option<&FieldInfo> {
+        match &self.kind {
+            VariantKind::NewType { fields, .. } | VariantKind::InlineNamed { fields } => {
+                fields.iter().find(|f| f.ident == name)
+            }
+            VariantKind::Unit => None,
+        }
+    }
+}
+
+/// Strip `Option<T>` -> `(true, T)`, otherwise `(false, original)`.
+fn unwrap_option(ty: &Type) -> (bool, Type) {
+    if let Type::Path(tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            if seg.ident == "Option" {
+                if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
+                    if let Some(syn::GenericArgument::Type(inner)) = ab.args.first() {
+                        return (true, inner.clone());
+                    }
+                }
+            }
+        }
+    }
+    (false, ty.clone())
+}
+
+/// Strip `&'a T` / `&mut T` -> `(true, T)`, otherwise `(false, original)`.
+fn unwrap_reference(ty: &Type) -> (bool, Type) {
+    if let Type::Reference(r) = ty {
+        return (true, (*r.elem).clone());
+    }
+    (false, ty.clone())
+}
+
+struct Presence {
+    is_option: bool,
+    is_reference: bool,
+    base: Type,
+}
+
+fn type_eq(a: &Type, b: &Type) -> bool {
+    quote!(#a).to_string() == quote!(#b).to_string()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Ref,
+    Mut,
+    Into,
+}
+
+//************************************************************************//
+
+#[proc_macro_attribute]
+pub fn extra(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as ExtraArgs);
+    let mut input = parse_macro_input!(item as ItemEnum);
+
+    let enum_ident = input.ident.clone();
+    let enum_generics = input.generics.clone();
+
+    let mut generated_structs: Vec<TokenStream2> = Vec::new();
+    let mut variant_infos: Vec<VariantInfo> = Vec::new();
+
+    for variant in input.variants.iter_mut() {
+        let struct_attr_pos = variant
+            .attrs
+            .iter()
+            .position(|a| a.path().is_ident("newtype"));
+
+        if let Some(pos) = struct_attr_pos {
+            if !args.newtype_variants {
+                panic!("`#[newtype]` requires `newtype_variants` to be enabled");
+            }
+            variant.attrs.remove(pos);
+
+            // Everything left over (e.g. #[derive(Debug, Clone)]) is
+            // forwarded onto the generated struct.
+            let extra_attrs = std::mem::take(&mut variant.attrs);
+
+            let struct_ident = variant.ident.clone();
+
+            let named: FieldsNamed = match &variant.fields {
+                Fields::Named(f) => f.clone(),
+                _ => panic!("#[newtype] is only supported on named-field variants"),
+            };
+
+            let field_infos: Vec<FieldInfo> = named
+                .named
+                .iter()
+                .map(|f| FieldInfo {
+                    ident: f.ident.clone().unwrap(),
+                    ty: f.ty.clone(),
+                })
+                .collect();
+
+            // Work out which of the enum's generics/lifetimes this
+            // particular struct actually needs.
+            let mut used = HashSet::new();
+            for f in &named.named {
+                used.extend(names_of(&f.ty));
+            }
+            let struct_generics = filter_generics(&enum_generics, &used);
+            let (impl_g, ty_g, where_g) = struct_generics.split_for_impl();
+            let fields = &named.named;
+
+            generated_structs.push(quote! {
+                #(#extra_attrs)*
+                struct #struct_ident #impl_g #where_g {
+                    #fields
+                }
+                #[allow(dead_code)]
+                impl #impl_g #struct_ident #ty_g #where_g {}
+            });
+
+            // Rewrite the enum variant as a newtype: `W(W<T>)`.
+            let use_args = use_site_generics(&struct_generics);
+            variant.fields = Fields::Unnamed(parse_quote!((#struct_ident #use_args)));
+
+            let binding = Ident::new(
+                &struct_ident.to_string().to_lowercase(),
+                struct_ident.span(),
+            );
+            variant_infos.push(VariantInfo {
+                ident: struct_ident,
+                kind: VariantKind::NewType {
+                    binding,
+                    fields: field_infos,
+                },
+            });
+        } else {
+            match &variant.fields {
+                Fields::Named(f) => {
+                    let fields = f
+                        .named
+                        .iter()
+                        .map(|fld| FieldInfo {
+                            ident: fld.ident.clone().unwrap(),
+                            ty: fld.ty.clone(),
+                        })
+                        .collect();
+                    variant_infos.push(VariantInfo {
+                        ident: variant.ident.clone(),
+                        kind: VariantKind::InlineNamed { fields },
+                    });
+                }
+                Fields::Unit => variant_infos.push(VariantInfo {
+                    ident: variant.ident.clone(),
+                    kind: VariantKind::Unit,
+                }),
+                Fields::Unnamed(_) => {
+                    panic!("tuple variants without `#[newtype]` are not supported")
+                }
+            }
+        }
+    }
+
+    let mut output = quote! { #input };
+    for s in generated_structs {
+        output.extend(s);
+    }
+
+    if args.common_accessors {
+        output.extend(generate_accessors(
+            &enum_ident,
+            &enum_generics,
+            &variant_infos,
+        ));
+    }
+
+    output.into()
+}
+
+//************************************************************************//
+
+fn generate_accessors(
+    enum_ident: &Ident,
+    enum_generics: &Generics,
+    variants: &[VariantInfo],
+) -> TokenStream2 {
+    // Collect field names in first-seen order across all variants.
+    let mut field_names: Vec<String> = Vec::new();
+    for v in variants {
+        let fields = match &v.kind {
+            VariantKind::NewType { fields, .. } | VariantKind::InlineNamed { fields } => fields,
+            VariantKind::Unit => continue,
+        };
+        for f in fields {
+            let name = f.ident.to_string();
+            if !field_names.contains(&name) {
+                field_names.push(name);
+            }
+        }
+    }
+
+    let mut methods = Vec::new();
+
+    for name in field_names {
+        let field_ident = Ident::new(&name, proc_macro2::Span::call_site());
+
+        let presences: Vec<Option<Presence>> = variants
+            .iter()
+            .map(|v| {
+                v.field(&name).map(|f| {
+                    let (is_opt, after_opt) = unwrap_option(&f.ty);
+                    let (is_ref, base) = unwrap_reference(&after_opt);
+                    Presence {
+                        is_option: is_opt,
+                        is_reference: is_ref,
+                        base,
+                    }
+                })
+            })
+            .collect();
+
+        // Make sure every present variant agrees on the base type;
+        // otherwise we can't sensibly unify and skip this field.
+        let base_ty: Option<Type> = {
+            let mut found: Option<Type> = None;
+            let mut ok = true;
+            for p in presences.iter().flatten() {
+                match &found {
+                    None => found = Some(p.base.clone()),
+                    Some(t) => {
+                        if !type_eq(t, &p.base) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ok { found } else { None }
+        };
+
+        let Some(base_ty) = base_ty else { continue };
+
+        let any_absent = presences.iter().any(|p| p.is_none());
+        let any_option = presences.iter().flatten().any(|p| p.is_option);
+        let any_reference = presences.iter().flatten().any(|p| p.is_reference);
+        let result_optional = any_absent || any_option;
+
+        let ref_ret = if result_optional {
+            quote!(Option<&#base_ty>)
+        } else {
+            quote!(&#base_ty)
+        };
+        let mut_ret = if result_optional {
+            quote!(Option<&mut #base_ty>)
+        } else {
+            quote!(&mut #base_ty)
+        };
+        let into_ret = if result_optional {
+            quote!(Option<#base_ty>)
+        } else {
+            quote!(#base_ty)
+        };
+
+        let ref_name = Ident::new(&format!("{name}_ref"), field_ident.span());
+        let mut_name = Ident::new(&format!("{name}_mut"), field_ident.span());
+        let into_name = Ident::new(&format!("into_{name}"), field_ident.span());
+
+        let ref_arms = build_arms(
+            enum_ident,
+            variants,
+            &field_ident,
+            &presences,
+            result_optional,
+            Mode::Ref,
+        );
+        methods.push(quote! {
+            fn #ref_name(&self) -> #ref_ret {
+                match self {
+                    #(#ref_arms)*
+                }
+            }
+        });
+
+        if !any_reference {
+            let mut_arms = build_arms(
+                enum_ident,
+                variants,
+                &field_ident,
+                &presences,
+                result_optional,
+                Mode::Mut,
+            );
+            methods.push(quote! {
+                fn #mut_name(&mut self) -> #mut_ret {
+                    match self {
+                        #(#mut_arms)*
+                    }
+                }
+            });
+
+            let into_arms = build_arms(
+                enum_ident,
+                variants,
+                &field_ident,
+                &presences,
+                result_optional,
+                Mode::Into,
+            );
+            methods.push(quote! {
+                fn #into_name(self) -> #into_ret {
+                    match self {
+                        #(#into_arms)*
+                    }
+                }
+            });
+        }
+    }
+
+    let (impl_g, ty_g, where_g) = enum_generics.split_for_impl();
+    quote! {
+        impl #impl_g #enum_ident #ty_g #where_g {
+            #(#methods)*
+        }
+    }
+}
+
+fn build_arms(
+    enum_ident: &Ident,
+    variants: &[VariantInfo],
+    field_ident: &Ident,
+    presences: &[Option<Presence>],
+    result_optional: bool,
+    mode: Mode,
+) -> Vec<TokenStream2> {
+    let mut arms = Vec::new();
+    let mut absent_emitted = false;
+
+    for (i, v) in variants.iter().enumerate() {
+        match &presences[i] {
+            None => {
+                if absent_emitted {
+                    continue;
+                }
+                absent_emitted = true;
+                // Collect every absent variant's wildcard pattern.
+                let pats: Vec<TokenStream2> = variants
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| presences[*j].is_none())
+                    .map(|(_, v2)| absent_pattern(enum_ident, v2))
+                    .collect();
+                arms.push(quote! { #(#pats)|* => None, });
+            }
+            Some(p) => {
+                let pat = present_pattern(enum_ident, v, field_ident);
+                let body = present_body(v, field_ident, p, result_optional, mode);
+                arms.push(quote! { #pat => #body, });
+            }
+        }
+    }
+
+    arms
+}
+
+fn absent_pattern(enum_ident: &Ident, v: &VariantInfo) -> TokenStream2 {
+    let vi = &v.ident;
+    match &v.kind {
+        VariantKind::NewType { .. } => quote!(#enum_ident::#vi(_)),
+        VariantKind::InlineNamed { .. } => quote!(#enum_ident::#vi { .. }),
+        VariantKind::Unit => quote!(#enum_ident::#vi),
+    }
+}
+
+fn present_pattern(enum_ident: &Ident, v: &VariantInfo, field_ident: &Ident) -> TokenStream2 {
+    let vi = &v.ident;
+    match &v.kind {
+        VariantKind::NewType { binding, .. } => quote!(#enum_ident::#vi(#binding)),
+        VariantKind::InlineNamed { .. } => quote!(#enum_ident::#vi { #field_ident, .. }),
+        VariantKind::Unit => unreachable!("unit variants never have a present field"),
+    }
+}
+
+fn present_body(
+    v: &VariantInfo,
+    field_ident: &Ident,
+    p: &Presence,
+    result_optional: bool,
+    mode: Mode,
+) -> TokenStream2 {
+    match &v.kind {
+        VariantKind::NewType { binding, .. } => {
+            if p.is_reference {
+                // Reference fields only ever get a `_ref` accessor.
+                if result_optional {
+                    quote!(Some(#binding.#field_ident))
+                } else {
+                    quote!(#binding.#field_ident)
+                }
+            } else if p.is_option {
+                match mode {
+                    Mode::Ref => quote!(#binding.#field_ident.as_ref()),
+                    Mode::Mut => quote!(#binding.#field_ident.as_mut()),
+                    Mode::Into => quote!(#binding.#field_ident),
+                }
+            } else {
+                match mode {
+                    Mode::Ref if result_optional => quote!(Some(&#binding.#field_ident)),
+                    Mode::Ref => quote!(&#binding.#field_ident),
+                    Mode::Mut if result_optional => quote!(Some(&mut #binding.#field_ident)),
+                    Mode::Mut => quote!(&mut #binding.#field_ident),
+                    Mode::Into if result_optional => quote!(Some(#binding.#field_ident)),
+                    Mode::Into => quote!(#binding.#field_ident),
+                }
+            }
+        }
+        VariantKind::InlineNamed { .. } => {
+            // Thanks to match ergonomics, `field_ident` is already bound
+            // as `&T` / `&mut T` / `T` depending on `mode`.
+            if p.is_reference {
+                if result_optional {
+                    quote!(Some(*#field_ident))
+                } else {
+                    quote!(*#field_ident)
+                }
+            } else if p.is_option {
+                match mode {
+                    Mode::Ref => quote!(#field_ident.as_ref()),
+                    Mode::Mut => quote!(#field_ident.as_mut()),
+                    Mode::Into => quote!(#field_ident),
+                }
+            } else if result_optional {
+                quote!(Some(#field_ident))
+            } else {
+                quote!(#field_ident)
+            }
+        }
+        VariantKind::Unit => unreachable!(),
+    }
+}
