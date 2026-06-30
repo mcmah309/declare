@@ -254,4 +254,59 @@ mod tests {
         assert_eq!(y.into_b(), Some(8));
         assert_eq!(z.into_b(), None);
     }
+
+    #[test]
+    fn try_from_shared_ref_w() {
+        let w = W {
+            a: 1,
+            b: Some(2),
+            d: "hello".to_string(),
+        };
+        let a: A<'_, String> = w.into();
+
+        let back_ref: &W<String> = <&W<String>>::try_from(&a).unwrap();
+        assert_eq!(back_ref.a, 1);
+
+        let z: A<'_, String> = A::Z { a: 5, c: 9 };
+        let err_ref = <&W<String>>::try_from(&z);
+        assert!(err_ref.is_err());
+        if let Err(returned_a_ref) = err_ref {
+            assert_eq!(*returned_a_ref.a_ref(), 5);
+        }
+    }
+
+    #[test]
+    fn try_from_mut_ref_w() {
+        let w = W {
+            a: 1,
+            b: Some(2),
+            d: "hello".to_string(),
+        };
+        let mut a: A<'_, String> = w.into();
+
+        {
+            let back_mut: &mut W<String> = <&mut W<String>>::try_from(&mut a).unwrap();
+            back_mut.a = 42;
+        }
+        assert_eq!(*a.a_ref(), 42);
+
+        let mut z: A<'_, String> = A::Z { a: 5, c: 9 };
+        let err_mut = <&mut W<String>>::try_from(&mut z);
+        assert!(err_mut.is_err());
+    }
+
+    #[test]
+    fn try_from_shared_ref_y() {
+        let value = String::from("abc");
+        let y = Y {
+            a: 10,
+            b: 20,
+            d: &value,
+        };
+        let a: A<'_, String> = y.into();
+
+        let back_ref: &Y<'_, String> = <&Y<'_, String>>::try_from(&a).unwrap();
+        assert_eq!(back_ref.a, 10);
+        assert_eq!(*back_ref.d, "abc");
+    }
 }

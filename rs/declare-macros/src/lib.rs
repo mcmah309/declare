@@ -341,6 +341,14 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
             let use_args = use_site_generics(&struct_generics);
             variant.fields = Fields::Unnamed(parse_quote!((#struct_ident #use_args)));
 
+            let internal_lifetime: syn::Lifetime = parse_quote!('declare_internal);
+            let mut ref_generics = enum_generics.clone();
+            ref_generics.params.insert(
+                0,
+                syn::GenericParam::Lifetime(syn::LifetimeParam::new(internal_lifetime.clone())),
+            );
+            let (ref_impl_g, _, _) = ref_generics.split_for_impl();
+
             // From<Struct> for Enum / TryFrom<Enum> for Struct
             conversions.push(quote! {
                 impl #enum_impl_g ::core::convert::From<#struct_ident #use_args> for #enum_ident #enum_ty_g #enum_where_g {
@@ -353,6 +361,28 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
                     type Error = #enum_ident #enum_ty_g;
 
                     fn try_from(value: #enum_ident #enum_ty_g) -> ::core::result::Result<Self, Self::Error> {
+                        match value {
+                            #enum_ident::#struct_ident(inner) => Ok(inner),
+                            other => Err(other),
+                        }
+                    }
+                }
+
+                impl #ref_impl_g ::core::convert::TryFrom<&#internal_lifetime #enum_ident #enum_ty_g> for &#internal_lifetime #struct_ident #use_args #enum_where_g {
+                    type Error = &#internal_lifetime #enum_ident #enum_ty_g;
+
+                    fn try_from(value: &#internal_lifetime #enum_ident #enum_ty_g) -> ::core::result::Result<Self, Self::Error> {
+                        match value {
+                            #enum_ident::#struct_ident(inner) => Ok(inner),
+                            other => Err(other),
+                        }
+                    }
+                }
+
+                impl #ref_impl_g ::core::convert::TryFrom<&#internal_lifetime mut #enum_ident #enum_ty_g> for &#internal_lifetime mut #struct_ident #use_args #enum_where_g {
+                    type Error = &#internal_lifetime #enum_ident #enum_ty_g;
+
+                    fn try_from(value: &#internal_lifetime mut #enum_ident #enum_ty_g) -> ::core::result::Result<Self, Self::Error> {
                         match value {
                             #enum_ident::#struct_ident(inner) => Ok(inner),
                             other => Err(other),
