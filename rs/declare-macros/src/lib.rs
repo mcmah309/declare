@@ -5,7 +5,7 @@ use proc_macro2::{TokenStream as TokenStream2, TokenTree};
 use quote::{ToTokens, quote};
 use syn::{
     Attribute, Fields, FieldsNamed, GenericParam, Generics, Ident, ItemEnum, PathArguments, Token,
-    Type, WhereClause,
+    Type, Visibility, WhereClause,
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
@@ -280,6 +280,7 @@ pub fn augment(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
+    let enum_vis = input.vis.clone();
     let enum_ident = input.ident.clone();
     let enum_generics = input.generics.clone();
     let (enum_impl_g, enum_ty_g, enum_where_g) = enum_generics.split_for_impl();
@@ -328,11 +329,16 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
             }
             let struct_generics = filter_generics(&enum_generics, &used);
             let (struct_impl_g, struct_ty_g, struct_where_g) = struct_generics.split_for_impl();
-            let fields = &named.named;
+            let mut fields = syn::punctuated::Punctuated::<syn::Field, syn::Token![,]>::new();
+            for f in named.named.iter() {
+                let mut f = f.clone();
+                f.vis = enum_vis.clone();
+                fields.push(f);
+            }
 
             generated_structs.push(quote! {
                 #(#extra_attrs)*
-                struct #struct_ident #struct_impl_g #struct_where_g {
+                #enum_vis struct #struct_ident #struct_impl_g #struct_where_g {
                     #fields
                 }
             });
@@ -439,6 +445,7 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
 
     if config.common_accessors {
         output.extend(generate_accessors(
+            &enum_vis,
             &enum_ident,
             &enum_generics,
             &variant_infos,
@@ -451,6 +458,7 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
 //************************************************************************//
 
 fn generate_accessors(
+    enum_vis: &Visibility,
     enum_ident: &Ident,
     enum_generics: &Generics,
     variants: &[VariantInfo],
@@ -545,7 +553,7 @@ fn generate_accessors(
             Mode::Ref,
         );
         methods.push(quote! {
-            fn #ref_name(&self) -> #ref_ret {
+            #enum_vis fn #ref_name(&self) -> #ref_ret {
                 match self {
                     #(#ref_arms)*
                 }
@@ -562,7 +570,7 @@ fn generate_accessors(
                 Mode::Mut,
             );
             methods.push(quote! {
-                fn #mut_name(&mut self) -> #mut_ret {
+                #enum_vis fn #mut_name(&mut self) -> #mut_ret {
                     match self {
                         #(#mut_arms)*
                     }
@@ -578,7 +586,7 @@ fn generate_accessors(
                 Mode::Into,
             );
             methods.push(quote! {
-                fn #into_name(self) -> #into_ret {
+                #enum_vis fn #into_name(self) -> #into_ret {
                     match self {
                         #(#into_arms)*
                     }
