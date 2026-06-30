@@ -206,16 +206,13 @@ impl VariantInfo {
 
 /// Strip `Option<T>` -> `(true, T)`, otherwise `(false, original)`.
 fn unwrap_option(ty: &Type) -> (bool, Type) {
-    if let Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
-            if seg.ident == "Option" {
-                if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
-                    if let Some(syn::GenericArgument::Type(inner)) = ab.args.first() {
-                        return (true, inner.clone());
-                    }
-                }
-            }
-        }
+    if let Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+        && seg.ident == "Option"
+        && let syn::PathArguments::AngleBracketed(ab) = &seg.arguments
+        && let Some(syn::GenericArgument::Type(inner)) = ab.args.first()
+    {
+        return (true, inner.clone());
     }
     (false, ty.clone())
 }
@@ -328,7 +325,7 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
                 used.extend(names_of(&f.ty));
             }
             let struct_generics = filter_generics(&enum_generics, &used);
-            let (struct_impl_g, struct_ty_g, struct_where_g) = struct_generics.split_for_impl();
+            let (struct_impl_g, _struct_ty_g, struct_where_g) = struct_generics.split_for_impl();
             let mut fields = syn::punctuated::Punctuated::<syn::Field, syn::Token![,]>::new();
             for f in named.named.iter() {
                 let mut f = f.clone();
