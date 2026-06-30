@@ -138,7 +138,7 @@ struct FieldInfo {
 
 #[derive(Clone)]
 enum VariantKind {
-    /// Generated from `#[newtype]`: `Variant(StructName<...>)`.
+    /// Generated from `#[struct]`: `Variant(StructName<...>)`.
     NewType {
         binding: Ident,
         fields: Vec<FieldInfo>,
@@ -216,8 +216,10 @@ pub fn extra(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let enum_ident = input.ident.clone();
     let enum_generics = input.generics.clone();
+    let (enum_impl_g, enum_ty_g, enum_where_g) = enum_generics.split_for_impl();
 
     let mut generated_structs: Vec<TokenStream2> = Vec::new();
+    let mut conversions: Vec<TokenStream2> = Vec::new();
     let mut variant_infos: Vec<VariantInfo> = Vec::new();
 
     for variant in input.variants.iter_mut() {
@@ -259,21 +261,39 @@ pub fn extra(attr: TokenStream, item: TokenStream) -> TokenStream {
                 used.extend(names_of(&f.ty));
             }
             let struct_generics = filter_generics(&enum_generics, &used);
-            let (impl_g, ty_g, where_g) = struct_generics.split_for_impl();
+            let (struct_impl_g, struct_ty_g, struct_where_g) = struct_generics.split_for_impl();
             let fields = &named.named;
 
             generated_structs.push(quote! {
                 #(#extra_attrs)*
-                struct #struct_ident #impl_g #where_g {
+                struct #struct_ident #struct_impl_g #struct_where_g {
                     #fields
                 }
-                #[allow(dead_code)]
-                impl #impl_g #struct_ident #ty_g #where_g {}
             });
 
             // Rewrite the enum variant as a newtype: `W(W<T>)`.
             let use_args = use_site_generics(&struct_generics);
             variant.fields = Fields::Unnamed(parse_quote!((#struct_ident #use_args)));
+
+            // From<Struct> for Enum / TryFrom<Enum> for Struct
+            conversions.push(quote! {
+                impl #enum_impl_g ::std::convert::From<#struct_ident #use_args> for #enum_ident #enum_ty_g #enum_where_g {
+                    fn from(value: #struct_ident #use_args) -> Self {
+                        #enum_ident::#struct_ident(value)
+                    }
+                }
+
+                impl #enum_impl_g ::std::convert::TryFrom<#enum_ident #enum_ty_g> for #struct_ident #use_args #enum_where_g {
+                    type Error = #enum_ident #enum_ty_g;
+
+                    fn try_from(value: #enum_ident #enum_ty_g) -> ::std::result::Result<Self, Self::Error> {
+                        match value {
+                            #enum_ident::#struct_ident(inner) => Ok(inner),
+                            other => Err(other),
+                        }
+                    }
+                }
+            });
 
             let binding = Ident::new(
                 &struct_ident.to_string().to_lowercase(),
@@ -316,6 +336,9 @@ pub fn extra(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut output = quote! { #input };
     for s in generated_structs {
         output.extend(s);
+    }
+    for c in conversions {
+        output.extend(c);
     }
 
     if args.common_accessors {
