@@ -1,7 +1,10 @@
 [package]
 name = "declare-macros"
-version = "0.1.0"
+description = "Macros for the declare crate"
+version = "0.0.1"
 edition = "2024"
+repository = "https://github.com/mcmah309/declare"
+license = "Apache-2.0"
 
 [lib]
 proc-macro = true

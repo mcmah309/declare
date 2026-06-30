@@ -1,17 +1,15 @@
 [package]
 name = "declare"
-# description = ""
+description = "Macros for declaring additional functionality - enums with newtype variants, enums with common accessors, etc."
 version = "0.0.1"
 edition = "2024"
-# repository = ""
-# license = "" # e.g. `Apache-2.0`
+repository = "https://github.com/mcmah309/declare"
+license = "Apache-2.0"
 # categories = []
 # keywords = []
-# documentation = "" # Alternative documentation
-# rust-version = "" # Min required rust version
 
 [dependencies]
-declare-macros = { path = "../declare-macros" } # version = "0.0.1"
+declare-macros = { path = "../declare-macros", version = "0.0.1" }
 
 [dev-dependencies]
 
