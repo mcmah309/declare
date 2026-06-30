@@ -1,4 +1,4 @@
 [workspace]
 resolver = "3"
-members = ["rs/declare", "rs/declare_macros"]
+members = ["rs/declare", "rs/declare-macros"]
 exclude = []
