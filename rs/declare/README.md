@@ -5,14 +5,14 @@
 [![docs.rs](https://img.shields.io/badge/docs.rs-declare-66c2a5?style=for-the-badge\&labelColor=555555\&logo=docs.rs)](https://docs.rs/declare)
 [![test status](https://img.shields.io/github/actions/workflow/status/mcmah309/declare/ci.yml?branch=main\&style=for-the-badge)](https://github.com/mcmah309/declare/actions/workflows/ci.yml)
 
-`declare` provides macros for reducing boilerplate around common Rust declarations. Rather than introducing new syntax, it generates the code you would typically write by hand while keeping the source concise and explicit.
+`declare` provides macros for reducing boilerplate around common Rust patterns.
 
-Currently it provides:
+## Enum
 
-* **`newtype_variants`** — Extract enum variants into standalone structs while generating `From`/`TryFrom` implementations.
+* **`newtype_variants`** — Extract enum inline struct variants into standalone structs and generate `From`/`TryFrom` implementations.
 * **`common_accessors`** — Generate accessors for fields shared across enum variants.
 
-## Example
+### Example
 
 ```rust
 #[declare::newtype_variants]
