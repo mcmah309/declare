@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "declare"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "declare-macros",
 ]
 
 [[package]]
 name = "declare-macros"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
