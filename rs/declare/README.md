@@ -11,13 +11,15 @@
 
 * **`newtype_variants`** — Extract enum inline struct variants into standalone structs and generate `From`/`TryFrom` implementations.
 * **`common_accessors`** — Generate accessors for fields shared across enum variants.
+* **`field_traits`** — Generates and implements accessors traits for fields.
 
 ### Example
 
 ```rust
 #[declare::newtype_variants]
 #[declare::common_accessors]
-// #[declare::augment(newtype_variants, common_accessors)] // one liner
+#[declare::field_traits]
+// #[declare::augment(newtype_variants, common_accessors, field_traits)] // one liner
 enum Message<'a> {
     #[newtype]
     #[derive(Debug)]
@@ -41,6 +43,9 @@ enum Message<'a> {
 <summary>Expansion</summary>
 
 ```rust
+// Recursive expansion of newtype_variants macro
+// ==============================================
+
 enum Message<'a> {
     Text(Text<'a>),
     Binary(Binary),
@@ -180,6 +185,92 @@ impl<'a> Message<'a> {
             Message::Text(_) | Message::Ping { .. } => None,
             Message::Binary(binary) => Some(binary.bytes),
         }
+    }
+}
+trait IdRef {
+    fn id_ref(&self) -> &usize;
+}
+trait IdMut {
+    fn id_mut(&mut self) -> &mut usize;
+}
+trait IntoId {
+    fn into_id(self) -> usize;
+}
+impl<'a> IdRef for Message<'a> {
+    fn id_ref(&self) -> &usize {
+        self.id_ref()
+    }
+}
+impl<'a> IdMut for Message<'a> {
+    fn id_mut(&mut self) -> &mut usize {
+        self.id_mut()
+    }
+}
+impl<'a> IntoId for Message<'a> {
+    fn into_id(self) -> usize {
+        self.into_id()
+    }
+}
+impl<'a> IdRef for Text<'a> {
+    fn id_ref(&self) -> &usize {
+        &self.id
+    }
+}
+impl<'a> IdMut for Text<'a> {
+    fn id_mut(&mut self) -> &mut usize {
+        &mut self.id
+    }
+}
+impl<'a> IntoId for Text<'a> {
+    fn into_id(self) -> usize {
+        self.id
+    }
+}
+impl IdRef for Binary {
+    fn id_ref(&self) -> &usize {
+        &self.id
+    }
+}
+impl IdMut for Binary {
+    fn id_mut(&mut self) -> &mut usize {
+        &mut self.id
+    }
+}
+impl IntoId for Binary {
+    fn into_id(self) -> usize {
+        self.id
+    }
+}
+trait BodyRef {
+    fn body_ref(&self) -> &str;
+}
+impl<'a> BodyRef for Text<'a> {
+    fn body_ref(&self) -> &str {
+        self.body
+    }
+}
+trait BytesRef {
+    fn bytes_ref(&self) -> &Vec<u8>;
+}
+trait BytesMut {
+    fn bytes_mut(&mut self) -> &mut Vec<u8>;
+}
+trait IntoBytes {
+    fn into_bytes(self) -> Vec<u8>;
+}
+impl BytesRef for Binary {
+    fn bytes_ref(&self) -> &Vec<u8> {
+        &self.bytes
+    }
+}
+impl BytesMut for Binary {
+    fn bytes_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
+}
+impl IntoBytes for Binary {
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 }
 ```
