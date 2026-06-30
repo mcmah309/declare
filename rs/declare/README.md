@@ -20,6 +20,7 @@ Currently it provides:
 // #[declare::augment(newtype_variants, common_accessors)] // one liner
 enum Message<'a> {
     #[newtype]
+    #[derive(Debug)]
     Text {
         id: usize,
         body: &'a str,
@@ -45,6 +46,7 @@ enum Message<'a> {
     Binary(Binary),
     Ping { id: usize },
 }
+#[derive(Debug)]
 struct Text<'a> {
     id: usize,
     body: &'a str,
@@ -67,6 +69,32 @@ impl<'a> ::core::convert::TryFrom<Message<'a>> for Text<'a> {
         }
     }
 }
+impl<'declare_internal, 'a> ::core::convert::TryFrom<&'declare_internal Message<'a>>
+    for &'declare_internal Text<'a>
+{
+    type Error = &'declare_internal Message<'a>;
+    fn try_from(
+        value: &'declare_internal Message<'a>,
+    ) -> ::core::result::Result<Self, Self::Error> {
+        match value {
+            Message::Text(inner) => Ok(inner),
+            other => Err(other),
+        }
+    }
+}
+impl<'declare_internal, 'a> ::core::convert::TryFrom<&'declare_internal mut Message<'a>>
+    for &'declare_internal mut Text<'a>
+{
+    type Error = &'declare_internal Message<'a>;
+    fn try_from(
+        value: &'declare_internal mut Message<'a>,
+    ) -> ::core::result::Result<Self, Self::Error> {
+        match value {
+            Message::Text(inner) => Ok(inner),
+            other => Err(other),
+        }
+    }
+}
 impl<'a> ::core::convert::From<Binary> for Message<'a> {
     fn from(value: Binary) -> Self {
         Message::Binary(value)
@@ -75,6 +103,32 @@ impl<'a> ::core::convert::From<Binary> for Message<'a> {
 impl<'a> ::core::convert::TryFrom<Message<'a>> for Binary {
     type Error = Message<'a>;
     fn try_from(value: Message<'a>) -> ::core::result::Result<Self, Self::Error> {
+        match value {
+            Message::Binary(inner) => Ok(inner),
+            other => Err(other),
+        }
+    }
+}
+impl<'declare_internal, 'a> ::core::convert::TryFrom<&'declare_internal Message<'a>>
+    for &'declare_internal Binary
+{
+    type Error = &'declare_internal Message<'a>;
+    fn try_from(
+        value: &'declare_internal Message<'a>,
+    ) -> ::core::result::Result<Self, Self::Error> {
+        match value {
+            Message::Binary(inner) => Ok(inner),
+            other => Err(other),
+        }
+    }
+}
+impl<'declare_internal, 'a> ::core::convert::TryFrom<&'declare_internal mut Message<'a>>
+    for &'declare_internal mut Binary
+{
+    type Error = &'declare_internal Message<'a>;
+    fn try_from(
+        value: &'declare_internal mut Message<'a>,
+    ) -> ::core::result::Result<Self, Self::Error> {
         match value {
             Message::Binary(inner) => Ok(inner),
             other => Err(other),
