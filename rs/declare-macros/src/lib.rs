@@ -343,16 +343,16 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
 
             // From<Struct> for Enum / TryFrom<Enum> for Struct
             conversions.push(quote! {
-                impl #enum_impl_g ::std::convert::From<#struct_ident #use_args> for #enum_ident #enum_ty_g #enum_where_g {
+                impl #enum_impl_g ::core::convert::From<#struct_ident #use_args> for #enum_ident #enum_ty_g #enum_where_g {
                     fn from(value: #struct_ident #use_args) -> Self {
                         #enum_ident::#struct_ident(value)
                     }
                 }
 
-                impl #enum_impl_g ::std::convert::TryFrom<#enum_ident #enum_ty_g> for #struct_ident #use_args #enum_where_g {
+                impl #enum_impl_g ::core::convert::TryFrom<#enum_ident #enum_ty_g> for #struct_ident #use_args #enum_where_g {
                     type Error = #enum_ident #enum_ty_g;
 
-                    fn try_from(value: #enum_ident #enum_ty_g) -> ::std::result::Result<Self, Self::Error> {
+                    fn try_from(value: #enum_ident #enum_ty_g) -> ::core::result::Result<Self, Self::Error> {
                         match value {
                             #enum_ident::#struct_ident(inner) => Ok(inner),
                             other => Err(other),
