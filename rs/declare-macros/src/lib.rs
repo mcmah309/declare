@@ -481,11 +481,7 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
         output.extend(c);
     }
 
-    // `field_traits` impls delegate to the enum's `_ref`/`_mut`/`into_` accessor
-    // methods, so generating those accessors is implied.
-    let needs_common_accessors = config.common_accessors || config.field_traits;
-
-    if needs_common_accessors {
+    if config.common_accessors {
         output.extend(generate_accessors(
             &enum_vis,
             &enum_ident,
@@ -880,25 +876,40 @@ fn generate_field_traits(
             });
         }
 
-        // enum impls, delegating to the `common_accessors`-generated methods // todo remove dependence on common_accessors
+        // enum impls (only when every variant carries the field non-optionally)
         if enum_fully_present {
+            let ref_arms =
+                build_arms(enum_ident, variants, &field_ident, &presences, false, Mode::Ref);
             out.extend(quote! {
                 impl #enum_impl_g #ref_trait_ident #use_field_args for #enum_ident #enum_ty_g #enum_where_g {
                     fn #ref_name(&self) -> &#base_ty {
-                        self.#ref_name()
+                        match self {
+                            #(#ref_arms)*
+                        }
                     }
                 }
             });
+
             if !any_reference {
+                let mut_arms = build_arms(
+                    enum_ident, variants, &field_ident, &presences, false, Mode::Mut,
+                );
+                let into_arms = build_arms(
+                    enum_ident, variants, &field_ident, &presences, false, Mode::Into,
+                );
                 out.extend(quote! {
                     impl #enum_impl_g #mut_trait_ident #use_field_args for #enum_ident #enum_ty_g #enum_where_g {
                         fn #mut_name(&mut self) -> &mut #base_ty {
-                            self.#mut_name()
+                            match self {
+                                #(#mut_arms)*
+                            }
                         }
                     }
                     impl #enum_impl_g #into_trait_ident #use_field_args for #enum_ident #enum_ty_g #enum_where_g {
                         fn #into_name(self) -> #base_ty {
-                            self.#into_name()
+                            match self {
+                                #(#into_arms)*
+                            }
                         }
                     }
                 });
