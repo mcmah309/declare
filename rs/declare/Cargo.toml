@@ -1,6 +1,6 @@
 [package]
 name = "declare"
-description = "Macros for declaring additional functionality - enums with newtype variants, enums with common accessors, etc."
+description = "Provides macros for reducing boilerplate around common Rust patterns - newtype variants, common accessors, field traits, etc."
 version = "0.1.2"
 edition = "2024"
 repository = "https://github.com/mcmah309/declare"
