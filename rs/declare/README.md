@@ -28,8 +28,8 @@ enum Message<'a> {
         id: usize,
         body: &'a str,
     },
-    // `foreign` means that a struct will not be generated.
-    // We are just redeclaring the body for `common_accessor` and `field_traits` generation
+    // `foreign` indicates that a struct will not be generated and comes from elsewhere.
+    // We only need to include fields in the body we want for `common_accessor` and `field_traits` generation
     #[newtype(foreign)]
     Binary {
         id: usize,
@@ -40,10 +40,10 @@ enum Message<'a> {
     },
 }
 
-// The `newtype(foreign)` above indicates this type comes from elsewhere, so we declare it here.
-// In a real scenario, this would likely come from another crate.
+// In a real scenario, this would likely come from another crate or module.
 struct Binary {
     id: usize,
+    tags: Vec<String>,
     bytes: Vec<u8>,
 }
 ```
