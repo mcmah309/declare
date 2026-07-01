@@ -85,6 +85,46 @@ fn collect_declare_macros(initial: &mut DeclareConfig, attrs: &mut Vec<Attribute
 
 //************************************************************************//
 
+/// Whether a `#[newtype]` annotation asks for struct generation or defers to a
+/// foreign (already-existing) struct.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewtypeKind {
+    /// `#[newtype]` — generate the struct alongside the enum.
+    Generate,
+    /// `#[newtype(foreign)]` — the struct already exists elsewhere; only emit
+    /// conversions/accessors/traits, not the struct definition itself.
+    Foreign,
+}
+
+/// Inspect a single attribute.  Returns `Some(NewtypeKind)` when the attribute
+/// is `#[newtype]` or `#[newtype(foreign)]`, `None` for anything else.
+fn parse_newtype_attr(attr: &Attribute) -> Option<NewtypeKind> {
+    if !attr.path().is_ident("newtype") {
+        return None;
+    }
+    match &attr.meta {
+        // Plain `#[newtype]`
+        syn::Meta::Path(_) => Some(NewtypeKind::Generate),
+        // `#[newtype(…)]`
+        syn::Meta::List(ml) => {
+            let token_str = ml.tokens.to_string();
+            match token_str.trim() {
+                "foreign" => Some(NewtypeKind::Foreign),
+                other => panic!(
+                    "unknown `#[newtype]` option `{other}`; \
+                     expected `#[newtype]` or `#[newtype(foreign)]`"
+                ),
+            }
+        }
+        _ => panic!(
+            "unexpected `#[newtype]` attribute form; \
+             expected `#[newtype]` or `#[newtype(foreign)]`"
+        ),
+    }
+}
+
+//************************************************************************//
+
 fn collect_names(ts: TokenStream2, names: &mut HashSet<String>) {
     let mut iter = ts.into_iter().peekable();
     while let Some(tt) = iter.next() {
@@ -120,6 +160,8 @@ fn param_name(p: &GenericParam) -> String {
     }
 }
 
+/// Return a subset of `generics` containing only the params whose names appear
+/// in `used`, together with any where-clause predicates that reference them.
 fn filter_generics(generics: &Generics, used: &HashSet<String>) -> Generics {
     let mut new_generics = Generics::default();
 
@@ -151,7 +193,7 @@ fn filter_generics(generics: &Generics, used: &HashSet<String>) -> Generics {
     new_generics
 }
 
-/// Build the `<'a, T>` style argument list used at a *use site* (no bounds).
+/// Build the `<'a, T>` argument list for use-sites (no bounds).
 fn use_site_generics(generics: &Generics) -> TokenStream2 {
     if generics.params.is_empty() {
         return quote!();
@@ -173,8 +215,7 @@ fn use_site_generics(generics: &Generics) -> TokenStream2 {
     quote!(<#(#args),*>)
 }
 
-/// Convert a `snake_case` field name into `PascalCase` for trait naming
-/// (e.g. `into_a` field-derived trait piece -> `A`, used as `ARef`, `AMut`, `IntoA`).
+/// `snake_case` → `PascalCase`  (e.g. `my_field` → `MyField`).
 fn pascal_case(s: &str) -> String {
     s.split('_')
         .filter(|w| !w.is_empty())
@@ -198,12 +239,17 @@ struct FieldInfo {
 
 #[derive(Clone)]
 enum VariantKind {
-    /// Generated from `#[newtype]`: `Variant(StructName<...>)`.
+    /// Newtype variant — the inner struct is either generated (`kind ==
+    /// Generate`) or expected to already exist (`kind == Foreign`).
     NewType {
+        /// How the struct came to exist.
+        newtype_kind: NewtypeKind,
+        /// Variable name used in match patterns, e.g. `text` for `Text`.
         binding: Ident,
+        /// Logical fields (used for accessor / trait generation).
         fields: Vec<FieldInfo>,
-        /// The generics actually declared on the generated struct (a filtered
-        /// subset of the enum's generics, based on what the struct's fields use).
+        /// Generics that the struct definition carries (filtered from the
+        /// enum's generics based on which the struct's fields actually use).
         generics: Generics,
     },
     /// A plain `Variant { a: T, b: U }` left untouched.
@@ -229,7 +275,11 @@ impl VariantInfo {
     }
 }
 
-/// Strip `Option<T>` -> `(true, T)`, otherwise `(false, original)`.
+// ============================================================================
+// Type-level helpers
+// ============================================================================
+
+/// Strip `Option<T>` → `(true, T)`, otherwise `(false, original)`.
 fn unwrap_option(ty: &Type) -> (bool, Type) {
     if let Type::Path(tp) = ty
         && let Some(seg) = tp.path.segments.last()
@@ -242,7 +292,7 @@ fn unwrap_option(ty: &Type) -> (bool, Type) {
     (false, ty.clone())
 }
 
-/// Strip `&'a T` / `&mut T` -> `(true, T)`, otherwise `(false, original)`.
+/// Strip `&'a T` / `&mut T` → `(true, T)`, otherwise `(false, original)`.
 fn unwrap_reference(ty: &Type) -> (bool, Type) {
     if let Type::Reference(r) = ty {
         return (true, (*r.elem).clone());
@@ -327,26 +377,33 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
     let mut variant_infos: Vec<VariantInfo> = Vec::new();
 
     for variant in input.variants.iter_mut() {
-        let struct_attr_pos = variant
+        // Look for `#[newtype]` or `#[newtype(foreign)]`.
+        let newtype_attr = variant
             .attrs
             .iter()
-            .position(|a| a.path().is_ident("newtype"));
+            .enumerate()
+            .find_map(|(i, a)| parse_newtype_attr(a).map(|k| (i, k)));
 
-        if let Some(pos) = struct_attr_pos {
+        if let Some((pos, newtype_kind)) = newtype_attr {
             if !config.newtype_variants {
-                panic!("`#[newtype]` requires `newtype_variants` to be enabled");
+                panic!(
+                    "`#[newtype]` / `#[newtype(foreign)]` require `newtype_variants` to be enabled"
+                );
             }
             variant.attrs.remove(pos);
 
-            // Everything left over (e.g. #[derive(Debug, Clone)]) is
-            // forwarded onto the generated struct.
+            // Attributes remaining on the variant are forwarded to the
+            // generated struct (only for generated structs; ignored for foreign structs).
             let extra_attrs = std::mem::take(&mut variant.attrs);
 
             let struct_ident = variant.ident.clone();
 
             let named: FieldsNamed = match &variant.fields {
                 Fields::Named(f) => f.clone(),
-                _ => panic!("#[newtype] is only supported on named-field variants"),
+                _ => panic!(
+                    "`#[newtype]` / `#[newtype(foreign)]` are only supported \
+                     on named-field variants"
+                ),
             };
 
             let field_infos: Vec<FieldInfo> = named
@@ -358,32 +415,37 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
                 })
                 .collect();
 
-            // Work out which of the enum's generics/lifetimes this
-            // particular struct actually needs.
+            // Work out which of the enum's generics this struct actually uses.
             let mut used = HashSet::new();
             for f in &named.named {
                 used.extend(names_of(&f.ty));
             }
             let struct_generics = filter_generics(&enum_generics, &used);
-            let (struct_impl_g, _struct_ty_g, struct_where_g) = struct_generics.split_for_impl();
-            let mut fields = syn::punctuated::Punctuated::<syn::Field, syn::Token![,]>::new();
-            for f in named.named.iter() {
-                let mut f = f.clone();
-                f.vis = enum_vis.clone();
-                fields.push(f);
+            let use_args = use_site_generics(&struct_generics);
+
+            if newtype_kind == NewtypeKind::Generate {
+                let (struct_impl_g, _struct_ty_g, struct_where_g) =
+                    struct_generics.split_for_impl();
+
+                let mut fields = syn::punctuated::Punctuated::<syn::Field, syn::Token![,]>::new();
+                for f in named.named.iter() {
+                    let mut f = f.clone();
+                    f.vis = enum_vis.clone();
+                    fields.push(f);
+                }
+
+                generated_structs.push(quote! {
+                    #(#extra_attrs)*
+                    #enum_vis struct #struct_ident #struct_impl_g #struct_where_g {
+                        #fields
+                    }
+                });
             }
 
-            generated_structs.push(quote! {
-                #(#extra_attrs)*
-                #enum_vis struct #struct_ident #struct_impl_g #struct_where_g {
-                    #fields
-                }
-            });
-
-            // Rewrite the enum variant as a newtype: `W(W<T>)`.
-            let use_args = use_site_generics(&struct_generics);
+            // Rewrite the enum variant to `Variant(StructName<…>)`.
             variant.fields = Fields::Unnamed(parse_quote!((#struct_ident #use_args)));
 
+            // Build a lifetime used as the borrow in the `TryFrom<&…>` impls.
             let internal_lifetime: syn::Lifetime = parse_quote!('declare_internal);
             let mut ref_generics = enum_generics.clone();
             ref_generics.params.insert(
@@ -394,16 +456,22 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
 
             // From<Struct> for Enum / TryFrom<Enum> for Struct
             conversions.push(quote! {
-                impl #enum_impl_g ::core::convert::From<#struct_ident #use_args> for #enum_ident #enum_ty_g #enum_where_g {
+                impl #enum_impl_g ::core::convert::From<#struct_ident #use_args>
+                    for #enum_ident #enum_ty_g #enum_where_g
+                {
                     fn from(value: #struct_ident #use_args) -> Self {
                         #enum_ident::#struct_ident(value)
                     }
                 }
 
-                impl #enum_impl_g ::core::convert::TryFrom<#enum_ident #enum_ty_g> for #struct_ident #use_args #enum_where_g {
+                impl #enum_impl_g ::core::convert::TryFrom<#enum_ident #enum_ty_g>
+                    for #struct_ident #use_args #enum_where_g
+                {
                     type Error = #enum_ident #enum_ty_g;
 
-                    fn try_from(value: #enum_ident #enum_ty_g) -> ::core::result::Result<Self, Self::Error> {
+                    fn try_from(
+                        value: #enum_ident #enum_ty_g,
+                    ) -> ::core::result::Result<Self, Self::Error> {
                         match value {
                             #enum_ident::#struct_ident(inner) => Ok(inner),
                             other => Err(other),
@@ -411,10 +479,15 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
                     }
                 }
 
-                impl #ref_impl_g ::core::convert::TryFrom<&#internal_lifetime #enum_ident #enum_ty_g> for &#internal_lifetime #struct_ident #use_args #enum_where_g {
+                impl #ref_impl_g ::core::convert::TryFrom<
+                    &#internal_lifetime #enum_ident #enum_ty_g
+                > for &#internal_lifetime #struct_ident #use_args #enum_where_g
+                {
                     type Error = &#internal_lifetime #enum_ident #enum_ty_g;
 
-                    fn try_from(value: &#internal_lifetime #enum_ident #enum_ty_g) -> ::core::result::Result<Self, Self::Error> {
+                    fn try_from(
+                        value: &#internal_lifetime #enum_ident #enum_ty_g,
+                    ) -> ::core::result::Result<Self, Self::Error> {
                         match value {
                             #enum_ident::#struct_ident(inner) => Ok(inner),
                             other => Err(other),
@@ -422,10 +495,15 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
                     }
                 }
 
-                impl #ref_impl_g ::core::convert::TryFrom<&#internal_lifetime mut #enum_ident #enum_ty_g> for &#internal_lifetime mut #struct_ident #use_args #enum_where_g {
+                impl #ref_impl_g ::core::convert::TryFrom<
+                    &#internal_lifetime mut #enum_ident #enum_ty_g
+                > for &#internal_lifetime mut #struct_ident #use_args #enum_where_g
+                {
                     type Error = &#internal_lifetime #enum_ident #enum_ty_g;
 
-                    fn try_from(value: &#internal_lifetime mut #enum_ident #enum_ty_g) -> ::core::result::Result<Self, Self::Error> {
+                    fn try_from(
+                        value: &#internal_lifetime mut #enum_ident #enum_ty_g,
+                    ) -> ::core::result::Result<Self, Self::Error> {
                         match value {
                             #enum_ident::#struct_ident(inner) => Ok(inner),
                             other => Err(other),
@@ -441,6 +519,7 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
             variant_infos.push(VariantInfo {
                 ident: struct_ident,
                 kind: VariantKind::NewType {
+                    newtype_kind,
                     binding,
                     fields: field_infos,
                     generics: struct_generics,
@@ -467,7 +546,9 @@ fn expand_fully(mut input: ItemEnum, config: &DeclareConfig) -> TokenStream {
                     kind: VariantKind::Unit,
                 }),
                 Fields::Unnamed(_) => {
-                    panic!("tuple variants without `#[newtype]` are not supported")
+                    panic!(
+                        "tuple variants without `#[newtype]` / `#[newtype(foreign)]` are not supported"
+                    )
                 }
             }
         }
@@ -545,25 +626,8 @@ fn generate_accessors(
             })
             .collect();
 
-        // Make sure every present variant agrees on the base type;
-        // otherwise we can't sensibly unify and skip this field.
-        let base_ty: Option<Type> = {
-            let mut found: Option<Type> = None;
-            let mut ok = true;
-            for p in presences.iter().flatten() {
-                match &found {
-                    None => found = Some(p.base.clone()),
-                    Some(t) => {
-                        if !type_eq(t, &p.base) {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            if ok { found } else { None }
-        };
-
+        // All present occurrences must agree on a base type.
+        let base_ty = unified_base_type(&presences);
         let Some(base_ty) = base_ty else { continue };
 
         let any_absent = presences.iter().any(|p| p.is_none());
@@ -601,9 +665,7 @@ fn generate_accessors(
         );
         methods.push(quote! {
             #enum_vis fn #ref_name(&self) -> #ref_ret {
-                match self {
-                    #(#ref_arms)*
-                }
+                match self { #(#ref_arms)* }
             }
         });
 
@@ -618,9 +680,7 @@ fn generate_accessors(
             );
             methods.push(quote! {
                 #enum_vis fn #mut_name(&mut self) -> #mut_ret {
-                    match self {
-                        #(#mut_arms)*
-                    }
+                    match self { #(#mut_arms)* }
                 }
             });
 
@@ -634,9 +694,7 @@ fn generate_accessors(
             );
             methods.push(quote! {
                 #enum_vis fn #into_name(self) -> #into_ret {
-                    match self {
-                        #(#into_arms)*
-                    }
+                    match self { #(#into_arms)* }
                 }
             });
         }
@@ -649,6 +707,211 @@ fn generate_accessors(
         }
     }
 }
+
+//************************************************************************//
+
+fn generate_field_traits(
+    enum_vis: &Visibility,
+    enum_ident: &Ident,
+    enum_generics: &Generics,
+    variants: &[VariantInfo],
+) -> TokenStream2 {
+    let (enum_impl_g, enum_ty_g, enum_where_g) = enum_generics.split_for_impl();
+
+    let mut field_names: Vec<String> = Vec::new();
+    for v in variants {
+        let fields = match &v.kind {
+            VariantKind::NewType { fields, .. } | VariantKind::InlineNamed { fields } => fields,
+            VariantKind::Unit => continue,
+        };
+        for f in fields {
+            let name = f.ident.to_string();
+            if !field_names.contains(&name) {
+                field_names.push(name);
+            }
+        }
+    }
+
+    let mut out = TokenStream2::new();
+
+    for name in field_names {
+        let field_ident = Ident::new(&name, proc_macro2::Span::call_site());
+
+        let presences: Vec<Option<Presence>> = variants
+            .iter()
+            .map(|v| {
+                v.field(&name).map(|f| {
+                    let (is_opt, after_opt) = unwrap_option(&f.ty);
+                    let (is_ref, base) = unwrap_reference(&after_opt);
+                    Presence {
+                        is_option: is_opt,
+                        is_reference: is_ref,
+                        base,
+                    }
+                })
+            })
+            .collect();
+
+        let base_ty = unified_base_type(&presences);
+        let Some(base_ty) = base_ty else { continue };
+
+        // No guaranteed non-optional accessor anywhere → skip.
+        if presences.iter().flatten().all(|p| p.is_option) {
+            continue;
+        }
+
+        let any_reference = presences.iter().flatten().any(|p| p.is_reference);
+        let any_absent = presences.iter().any(|p| p.is_none());
+        let any_option = presences.iter().flatten().any(|p| p.is_option);
+        let enum_fully_present = !any_absent && !any_option;
+
+        // Generics needed for the field's base type — used in trait decls and
+        // all impl blocks that reference this trait.
+        let used = names_of(&base_ty);
+        let field_generics = filter_generics(enum_generics, &used);
+        let (field_impl_g, _field_ty_g, field_where_g) = field_generics.split_for_impl();
+        let use_field_args = use_site_generics(&field_generics);
+
+        let pascal = pascal_case(&name);
+        let ref_trait_ident = Ident::new(&format!("{pascal}Ref"), field_ident.span());
+        let mut_trait_ident = Ident::new(&format!("{pascal}Mut"), field_ident.span());
+        let into_trait_ident = Ident::new(&format!("Into{pascal}"), field_ident.span());
+
+        let ref_name = Ident::new(&format!("{name}_ref"), field_ident.span());
+        let mut_name = Ident::new(&format!("{name}_mut"), field_ident.span());
+        let into_name = Ident::new(&format!("into_{name}"), field_ident.span());
+
+        // --- trait declarations ---
+        out.extend(quote! {
+            #enum_vis trait #ref_trait_ident #field_impl_g #field_where_g {
+                fn #ref_name(&self) -> &#base_ty;
+            }
+        });
+        if !any_reference {
+            out.extend(quote! {
+                #enum_vis trait #mut_trait_ident #field_impl_g #field_where_g {
+                    fn #mut_name(&mut self) -> &mut #base_ty;
+                }
+                #enum_vis trait #into_trait_ident #field_impl_g #field_where_g {
+                    fn #into_name(self) -> #base_ty;
+                }
+            });
+        }
+
+        // enum impl (only when every variant carries the field non-optionally)
+        if enum_fully_present {
+            let ref_arms = build_arms(
+                enum_ident,
+                variants,
+                &field_ident,
+                &presences,
+                false,
+                Mode::Ref,
+            );
+            out.extend(quote! {
+                impl #enum_impl_g #ref_trait_ident #use_field_args
+                    for #enum_ident #enum_ty_g #enum_where_g
+                {
+                    fn #ref_name(&self) -> &#base_ty {
+                        match self { #(#ref_arms)* }
+                    }
+                }
+            });
+
+            if !any_reference {
+                let mut_arms = build_arms(
+                    enum_ident,
+                    variants,
+                    &field_ident,
+                    &presences,
+                    false,
+                    Mode::Mut,
+                );
+                let into_arms = build_arms(
+                    enum_ident,
+                    variants,
+                    &field_ident,
+                    &presences,
+                    false,
+                    Mode::Into,
+                );
+                out.extend(quote! {
+                    impl #enum_impl_g #mut_trait_ident #use_field_args
+                        for #enum_ident #enum_ty_g #enum_where_g
+                    {
+                        fn #mut_name(&mut self) -> &mut #base_ty {
+                            match self { #(#mut_arms)* }
+                        }
+                    }
+                    impl #enum_impl_g #into_trait_ident #use_field_args
+                        for #enum_ident #enum_ty_g #enum_where_g
+                    {
+                        fn #into_name(self) -> #base_ty {
+                            match self { #(#into_arms)* }
+                        }
+                    }
+                });
+            }
+        }
+
+        // per-newtype-struct impls, accessing the field directly
+        for (i, v) in variants.iter().enumerate() {
+            let VariantKind::NewType {
+                generics: struct_generics,
+                ..
+            } = &v.kind
+            else {
+                continue;
+            };
+            let Some(p) = &presences[i] else { continue };
+            if p.is_option {
+                continue;
+            }
+
+            let struct_ident = &v.ident;
+            let (struct_impl_g, struct_ty_g, struct_where_g) = struct_generics.split_for_impl();
+
+            let ref_body = if p.is_reference {
+                // Field is already `&'a T`; returning it satisfies `&T`.
+                quote!(self.#field_ident)
+            } else {
+                quote!(&self.#field_ident)
+            };
+            out.extend(quote! {
+                impl #struct_impl_g #ref_trait_ident #use_field_args
+                    for #struct_ident #struct_ty_g #struct_where_g
+                {
+                    fn #ref_name(&self) -> &#base_ty {
+                        #ref_body
+                    }
+                }
+            });
+
+            if !any_reference {
+                out.extend(quote! {
+                    impl #struct_impl_g #mut_trait_ident #use_field_args
+                        for #struct_ident #struct_ty_g #struct_where_g
+                    {
+                        fn #mut_name(&mut self) -> &mut #base_ty {
+                            &mut self.#field_ident
+                        }
+                    }
+                    impl #struct_impl_g #into_trait_ident #use_field_args
+                        for #struct_ident #struct_ty_g #struct_where_g
+                    {
+                        fn #into_name(self) -> #base_ty {
+                            self.#field_ident
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    out
+}
+
+//************************************************************************//
 
 fn build_arms(
     enum_ident: &Ident,
@@ -668,7 +931,7 @@ fn build_arms(
                     continue;
                 }
                 absent_emitted = true;
-                // Collect every absent variant's wildcard pattern.
+                // Collect every absent variant's wildcard pattern into one arm.
                 let pats: Vec<TokenStream2> = variants
                     .iter()
                     .enumerate()
@@ -716,7 +979,6 @@ fn present_body(
     match &v.kind {
         VariantKind::NewType { binding, .. } => {
             if p.is_reference {
-                // Reference fields only ever get a `_ref` accessor.
                 if result_optional {
                     quote!(Some(#binding.#field_ident))
                 } else {
@@ -740,8 +1002,7 @@ fn present_body(
             }
         }
         VariantKind::InlineNamed { .. } => {
-            // Thanks to match ergonomics, `field_ident` is already bound
-            // as `&T` / `&mut T` / `T` depending on `mode`.
+            // Match ergonomics bind `field_ident` as `&T` / `&mut T` / `T`.
             if p.is_reference {
                 if result_optional {
                     quote!(Some(*#field_ident))
@@ -766,204 +1027,19 @@ fn present_body(
 
 //************************************************************************//
 
-/// `field_traits`: per-field traits (`<Field>Ref` / `<Field>Mut` / `Into<Field>`)
-/// implemented by every `#[newtype]` struct that has the field non-optionally,
-/// and by the enum itself when *every* variant has the field non-optionally.
-fn generate_field_traits(
-    enum_vis: &Visibility,
-    enum_ident: &Ident,
-    enum_generics: &Generics,
-    variants: &[VariantInfo],
-) -> TokenStream2 {
-    let (enum_impl_g, enum_ty_g, enum_where_g) = enum_generics.split_for_impl();
-
-    let mut field_names: Vec<String> = Vec::new();
-    for v in variants {
-        let fields = match &v.kind {
-            VariantKind::NewType { fields, .. } | VariantKind::InlineNamed { fields } => fields,
-            VariantKind::Unit => continue,
-        };
-        for f in fields {
-            let name = f.ident.to_string();
-            if !field_names.contains(&name) {
-                field_names.push(name);
+/// Return the single base type that all present `Presence` entries agree on,
+/// or `None` if they disagree (meaning no unified accessor is possible).
+fn unified_base_type(presences: &[Option<Presence>]) -> Option<Type> {
+    let mut found: Option<Type> = None;
+    for p in presences.iter().flatten() {
+        match &found {
+            None => found = Some(p.base.clone()),
+            Some(t) => {
+                if !type_eq(t, &p.base) {
+                    return None;
+                }
             }
         }
     }
-
-    let mut out = TokenStream2::new();
-
-    for name in field_names {
-        let field_ident = Ident::new(&name, proc_macro2::Span::call_site());
-
-        let presences: Vec<Option<Presence>> = variants
-            .iter()
-            .map(|v| {
-                v.field(&name).map(|f| {
-                    let (is_opt, after_opt) = unwrap_option(&f.ty);
-                    let (is_ref, base) = unwrap_reference(&after_opt);
-                    Presence {
-                        is_option: is_opt,
-                        is_reference: is_ref,
-                        base,
-                    }
-                })
-            })
-            .collect();
-
-        // Every present occurrence of the field must agree on a base type,
-        // or there's no single trait signature to unify around.
-        let base_ty: Option<Type> = {
-            let mut found: Option<Type> = None;
-            let mut ok = true;
-            for p in presences.iter().flatten() {
-                match &found {
-                    None => found = Some(p.base.clone()),
-                    Some(t) => {
-                        if !type_eq(t, &p.base) {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            if ok { found } else { None }
-        };
-        let Some(base_ty) = base_ty else { continue };
-
-        // If every present occurrence is `Option<...>`, there's no
-        // guaranteed accessor anywhere to back a trait impl. Skip it.
-        if presences.iter().flatten().all(|p| p.is_option) {
-            continue;
-        }
-
-        let any_reference = presences.iter().flatten().any(|p| p.is_reference);
-        let any_absent = presences.iter().any(|p| p.is_none());
-        let any_option = presences.iter().flatten().any(|p| p.is_option);
-        let enum_fully_present = !any_absent && !any_option;
-
-        // Generics needed just for this field's base type (a subset of the
-        // enum's generics), used both for the trait declaration and as the
-        // trait's use-site arguments in every impl.
-        let used = names_of(&base_ty);
-        let field_generics = filter_generics(enum_generics, &used);
-        let (field_impl_g, _field_ty_g, field_where_g) = field_generics.split_for_impl();
-        let use_field_args = use_site_generics(&field_generics);
-
-        let pascal = pascal_case(&name);
-        let ref_trait_ident = Ident::new(&format!("{pascal}Ref"), field_ident.span());
-        let mut_trait_ident = Ident::new(&format!("{pascal}Mut"), field_ident.span());
-        let into_trait_ident = Ident::new(&format!("Into{pascal}"), field_ident.span());
-
-        let ref_name = Ident::new(&format!("{name}_ref"), field_ident.span());
-        let mut_name = Ident::new(&format!("{name}_mut"), field_ident.span());
-        let into_name = Ident::new(&format!("into_{name}"), field_ident.span());
-
-        // --- trait declarations ---
-        out.extend(quote! {
-            #enum_vis trait #ref_trait_ident #field_impl_g #field_where_g {
-                fn #ref_name(&self) -> &#base_ty;
-            }
-        });
-        if !any_reference {
-            out.extend(quote! {
-                #enum_vis trait #mut_trait_ident #field_impl_g #field_where_g {
-                    fn #mut_name(&mut self) -> &mut #base_ty;
-                }
-                #enum_vis trait #into_trait_ident #field_impl_g #field_where_g {
-                    fn #into_name(self) -> #base_ty;
-                }
-            });
-        }
-
-        // enum impls (only when every variant carries the field non-optionally)
-        if enum_fully_present {
-            let ref_arms =
-                build_arms(enum_ident, variants, &field_ident, &presences, false, Mode::Ref);
-            out.extend(quote! {
-                impl #enum_impl_g #ref_trait_ident #use_field_args for #enum_ident #enum_ty_g #enum_where_g {
-                    fn #ref_name(&self) -> &#base_ty {
-                        match self {
-                            #(#ref_arms)*
-                        }
-                    }
-                }
-            });
-
-            if !any_reference {
-                let mut_arms = build_arms(
-                    enum_ident, variants, &field_ident, &presences, false, Mode::Mut,
-                );
-                let into_arms = build_arms(
-                    enum_ident, variants, &field_ident, &presences, false, Mode::Into,
-                );
-                out.extend(quote! {
-                    impl #enum_impl_g #mut_trait_ident #use_field_args for #enum_ident #enum_ty_g #enum_where_g {
-                        fn #mut_name(&mut self) -> &mut #base_ty {
-                            match self {
-                                #(#mut_arms)*
-                            }
-                        }
-                    }
-                    impl #enum_impl_g #into_trait_ident #use_field_args for #enum_ident #enum_ty_g #enum_where_g {
-                        fn #into_name(self) -> #base_ty {
-                            match self {
-                                #(#into_arms)*
-                            }
-                        }
-                    }
-                });
-            }
-        }
-
-        // per-newtype-struct impls, accessing the field directly
-        for (i, v) in variants.iter().enumerate() {
-            let VariantKind::NewType {
-                generics: struct_generics,
-                ..
-            } = &v.kind
-            else {
-                continue;
-            };
-            let Some(p) = &presences[i] else { continue };
-            if p.is_option {
-                continue;
-            }
-
-            let struct_ident = &v.ident;
-            let (struct_impl_g, struct_ty_g, struct_where_g) = struct_generics.split_for_impl();
-
-            // `is_reference` fields are stored as `&'a T` already, so
-            // returning the field itself satisfies `&T` via subtyping.
-            let ref_body = if p.is_reference {
-                quote!(self.#field_ident)
-            } else {
-                quote!(&self.#field_ident)
-            };
-            out.extend(quote! {
-                impl #struct_impl_g #ref_trait_ident #use_field_args for #struct_ident #struct_ty_g #struct_where_g {
-                    fn #ref_name(&self) -> &#base_ty {
-                        #ref_body
-                    }
-                }
-            });
-
-            if !any_reference {
-                out.extend(quote! {
-                    impl #struct_impl_g #mut_trait_ident #use_field_args for #struct_ident #struct_ty_g #struct_where_g {
-                        fn #mut_name(&mut self) -> &mut #base_ty {
-                            &mut self.#field_ident
-                        }
-                    }
-                    impl #struct_impl_g #into_trait_ident #use_field_args for #struct_ident #struct_ty_g #struct_where_g {
-                        fn #into_name(self) -> #base_ty {
-                            self.#field_ident
-                        }
-                    }
-                });
-            }
-        }
-    }
-
-    out
+    found
 }

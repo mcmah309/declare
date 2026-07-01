@@ -7,8 +7,7 @@ enum Enum<'a, T>
 where
     T: core::fmt::Debug,
 {
-    #[newtype]
-    #[derive(Debug, Clone)]
+    #[newtype(foreign)]
     W {
         a: usize,
         b: Option<usize>,
@@ -25,6 +24,16 @@ where
         a: usize,
         c: usize,
     },
+}
+
+#[derive(Debug, Clone)]
+struct W<T>
+where
+    T: core::fmt::Debug,
+{
+    a: usize,
+    b: Option<usize>,
+    d: T,
 }
 
 #[cfg(test)]

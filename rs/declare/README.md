@@ -21,13 +21,16 @@
 #[declare::field_traits]
 // #[declare::augment(newtype_variants, common_accessors, field_traits)] // one liner
 enum Message<'a> {
+    // Instead of an inline struct, a newtype struct will be used (`Text(Text)`)
     #[newtype]
     #[derive(Debug)]
     Text {
         id: usize,
         body: &'a str,
     },
-    #[newtype]
+    // `foreign` means that a struct will not be generated.
+    // We are just redeclaring the body for `common_accessor` and `field_traits` generation
+    #[newtype(foreign)]
     Binary {
         id: usize,
         bytes: Vec<u8>,
@@ -36,11 +39,18 @@ enum Message<'a> {
         id: usize,
     },
 }
+
+// The `newtype(foreign)` above indicates this type comes from elsewhere, so we declare it here.
+// In a real scenario, this would likely come from another crate.
+struct Binary {
+    id: usize,
+    bytes: Vec<u8>,
+}
 ```
 
 <details>
 
-<summary>Expansion</summary>
+<summary>Macro Expansion</summary>
 
 ```rust
 // Recursive expansion of newtype_variants macro
@@ -55,10 +65,6 @@ enum Message<'a> {
 struct Text<'a> {
     id: usize,
     body: &'a str,
-}
-struct Binary {
-    id: usize,
-    bytes: Vec<u8>,
 }
 impl<'a> ::core::convert::From<Text<'a>> for Message<'a> {
     fn from(value: Text<'a>) -> Self {
